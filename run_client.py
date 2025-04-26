@@ -16,6 +16,6 @@ async def main():
     partition = partition.train_test_split(test_size=0.2, seed=42)
     x_train, y_train = partition["train"]["img"] / 255.0, partition["train"]["label"]
 
-    await fl_client_quic("localhost", 8443, model, x_train, y_train)
+    await fl_client_quic("localhost", 4433, model, x_train, y_train)
 
 asyncio.run(main())

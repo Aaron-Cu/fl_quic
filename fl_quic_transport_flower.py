@@ -5,8 +5,9 @@ import pickle
 import time
 from aioquic.asyncio import connect, serve
 from aioquic.quic.configuration import QuicConfiguration
-
 from aioquic.asyncio.protocol import QuicConnectionProtocol
+from aioquic.quic.events import HandshakeCompleted, StreamDataReceived  # <-- ADD THIS
+
 
 class FLQuicProtocol(QuicConnectionProtocol):
     def __init__(self, *args, server: "FLQuicServer", **kwargs):
@@ -85,8 +86,8 @@ async def fl_client_quic(host, port, model, x_train, y_train):
     configuration.server_name = "localhost"
     configuration.alpn_protocols = ["hq-29"]
 
-    with open("ca_cert.pem", "rb") as f:
-        configuration.load_verify_locations(cadata=f.read().decode())
+    configuration.load_verify_locations(cafile="ca_cert.pem")
+
 
     async with connect(
         host, 
@@ -94,7 +95,7 @@ async def fl_client_quic(host, port, model, x_train, y_train):
         configuration=configuration, 
         session_ticket_handler=None
     ) as client:
-        quic_stream = await client.create_stream()
+        reader, writer = await client.create_stream()
 
 
         # Step 1: Train locally
@@ -126,11 +127,19 @@ async def fl_client_quic(host, port, model, x_train, y_train):
         # Step 3: Send to server
         serialized = serialize_proto(fitres)
         print(f"[Client] Sending FitRes ({len(serialized)} bytes)...")
-        quic_stream.write(serialized)
-        await quic_stream._send_stream_data(end_stream=True)
+        # After sending FitRes
+        writer.write(serialized)
+        await writer.drain()
+        writer.write_eof()
 
-        # Step 4: Receive FitIns
-        response = await quic_stream.read()
+        # Correct way to read FitIns
+        response = b""
+        while True:
+            chunk = await reader.read(4096)
+            if not chunk:
+                break
+            response += chunk
+
         fitins = deserialize_proto(response, fed.FitIns)
         received_weights = [pickle.loads(t) for t in fitins.parameters.tensors]
         model.set_weights(received_weights)
@@ -143,23 +152,31 @@ class FLQuicServer:
     def __init__(self):
         self.received_updates = []
 
-    async def handle_stream(self, stream_id, quic_stream):
+    async def handle_stream(self, stream_id, reader, writer):
         print("[Server] New client connected.")
-        data = await quic_stream.read()
+
+        # Read FitRes
+        data = await reader.read()
         fitres = deserialize_proto(data, fed.FitRes)
         self.received_updates.append(fitres)
 
-        print(f"[Server] Received FitRes: {fitres.num_examples} examples, "
-              f"Accuracy {fitres.metrics['accuracy']:.4f}")
+        print(f"[Server] Received FitRes: {fitres.num_examples} examples, Accuracy {fitres.metrics['accuracy']:.4f}")
 
+        # Dummy aggregation
         received_weights = [pickle.loads(t) for t in fitres.parameters.tensors]
         fitins = fed.FitIns()
         fitins.parameters.tensors.extend([pickle.dumps(w) for w in received_weights])
         fitins.parameters.tensor_type = "weights_pickle"
 
         serialized = serialize_proto(fitins)
-        await quic_stream.write(serialized)
-        print(f"[Server] Sent FitIns ({len(serialized)} bytes) back to client.")
+
+        # ✅ Correct send:
+        writer.write(serialized)
+        await writer.drain()
+        writer.write_eof()
+
+        print("[Server] Sent FitIns to client.")
+
 
     async def run(self, host="0.0.0.0", port=4433):
         configuration = QuicConfiguration(is_client=False)
@@ -167,22 +184,21 @@ class FLQuicServer:
         configuration.verify_mode = None
         configuration.alpn_protocols = ["hq-29"]
 
-        from aioquic.asyncio.protocol import QuicConnectionProtocol
+        async def handler(stream_id, reader, writer):
+            await self.handle_stream(stream_id, reader, writer)  # <--- 3 parameters!
 
         await serve(
             host,
             port,
             configuration=configuration,
             create_protocol=lambda *args, **kwargs: FLQuicProtocol(*args, server=self, **kwargs),
-            stream_handler=None 
+            stream_handler=handler  # <-- not None!
         )
 
-
         print(f"[Server] QUIC server running at {host}:{port}")
-
-        # Hold forever manually
         while True:
             await asyncio.sleep(3600)
+
 
 
 
